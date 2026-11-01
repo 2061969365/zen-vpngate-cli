@@ -1,0 +1,121 @@
+name: vpngate-singbox-cli
+
+# 用 vpngate_to_singbox.py 把 VPNGate 节点转成 sing-box openvpn-client，
+# 每个节点起一个独立 mixed 端口，官方 CLI 逐节点发请求，记录是否 200/真实回答。
+on:
+  workflow_dispatch:
+    inputs:
+      nodes_per_shard:
+        description: nodes tested per shard
+        default: "3"
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: egress ip (runner)
+        run: |
+          curl -s -m 20 http://ip-api.com/json | python3 -c 'import json,sys; j=json.load(sys.stdin); print("SHARD=${{ matrix.shard }} RUNNER_IP=", j.get("query"), j.get("countryCode",""), j.get("as",""))'
+
+      - name: install sing-box
+        run: |
+          set -e
+          V=$(curl -s -m 30 https://api.github.com/repos/SagerNet/sing-box/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))')
+          echo "SINGBOX_VERSION=$V"
+          curl -sL -m 180 -o /tmp/sb.tgz "https://github.com/SagerNet/sing-box/releases/download/v${V}/sing-box-${V}-linux-amd64.tar.gz"
+          tar xzf /tmp/sb.tgz -C /tmp
+          sudo install -m755 "/tmp/sing-box-${V}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          sing-box version | head -2
+
+      - name: install official cli
+        run: |
+          set -u
+          npm install -g @opencode/cli@latest >/tmp/npm.log 2>&1 || { echo "CLI_INSTALL_FAIL"; tail -10 /tmp/npm.log; exit 0; }
+          echo "CLI_VERSION=$(opencode --version 2>&1 | head -1)"
+
+      - name: fetch vpngate snapshot + convert
+        run: |
+          set -e
+          curl -s -m 120 -o /tmp/vg.csv "https://www.vpngate.net/api/iphone/" || true
+          echo "CSV_BYTES=$(wc -c </tmp/vg.csv) LINES=$(wc -l </tmp/vg.csv)"
+          git clone --depth 1 https://github.com/2061969365/railway-vpngate-combined.git /tmp/conv >/dev/null 2>&1
+          cd /tmp
+          python3 conv/vpngate_to_singbox.py --csv vg.csv --output sb.json --limit 40 --tag vpn --no-probe
+          python3 - <<'PY'
+          import json
+          cfg=json.load(open('/tmp/sb.json'))
+          eps=cfg['endpoints']
+          shard=int('${{ matrix.shard }}')
+          n=int('${{ inputs.nodes_per_shard }}')
+          start=(shard-1)*n
+          chosen=eps[start:start+n]
+          print("TOTAL_ENDPOINTS", len(eps), "CHOSEN", [e['tag']+"@"+str(e.get('server')) for e in chosen])
+          for i,ep in enumerate(chosen):
+              c={"log":{"level":"warn"},
+                 "endpoints":[ep],
+                 "outbounds":[{"type":"direct","tag":"direct"}],
+                 "inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":19100+i}],
+                 "route":{"final":ep["tag"]}}
+              json.dump(c,open(f"/tmp/sb{i}.json","w"),indent=2)
+              print("NODE",i,ep["tag"],ep.get("server"),ep.get("server_port"))
+          open('/tmp/node_count','w').write(str(len(chosen)))
+          PY
+
+      - name: run cli through each vpn node
+        run: |
+          set -u
+          n=$(cat /tmp/node_count)
+          : > /tmp/results.txt
+          for i in $(seq 0 $((n-1))); do
+            port=$((19100+i))
+            tag=$(python3 -c "import json;print(json.load(open('/tmp/sb${i}.json'))['endpoints'][0]['tag'])")
+            srv=$(python3 -c "import json;e=json.load(open('/tmp/sb${i}.json'))['endpoints'][0];print(e.get('server'))")
+            sing-box run -c /tmp/sb${i}.json >/tmp/sb${i}.log 2>&1 &
+            pid=$!
+            ok=0
+            for t in $(seq 1 45); do
+              if (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null; then ok=1; break; fi
+              kill -0 $pid 2>/dev/null || break
+              sleep 2
+            done
+            if [ "$ok" != "1" ]; then
+              echo "NODE$i tag=$tag srv=$srv TUNNEL=down" | tee -a /tmp/results.txt
+              tail -5 /tmp/sb${i}.log | cut -c1-200
+              kill $pid 2>/dev/null || true
+              continue
+            fi
+            export HTTPS_PROXY="http://127.0.0.1:$port" HTTP_PROXY="http://127.0.0.1:$port" ALL_PROXY="http://127.0.0.1:$port"
+            export NO_PROXY="127.0.0.1,localhost"
+            ipinfo=$(curl -s -m 25 -x "http://127.0.0.1:$port" "https://api.ipify.org/?format=text" 2>&1 | head -c 40)
+            ipcode=$(curl -s -o /dev/null -w '%{http_code}' -m 25 -x "http://127.0.0.1:$port" https://api.ipify.org 2>/dev/null)
+            for round in 1 2; do
+              set +e
+              out=$(timeout 120 opencode run -m opencode/deepseek-v4.1-flash-free "第${round}次：请用一句话说明你能做什么。只回复这一句。" 2>&1)
+              rc=$?
+              set -e
+              clean=$(printf '%s' "$out" | sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\r//g')
+              if [ $rc -eq 0 ] && [ ${#clean} -gt 25 ]; then verdict="OK200"
+              elif printf '%s' "$clean" | grep -q 'Free usage limit'; then verdict="429"
+              elif printf '%s' "$clean" | grep -q 'Model unavailable'; then verdict="MODEL_BAD"
+              elif [ $rc -eq 124 ]; then verdict="TIMEOUT"
+              else verdict="FAIL rc=$rc"; fi
+              echo "NODE$i tag=$tag srv=$srv exitIP=$ipinfo ipify_http=$ipcode round=$round verdict=$verdict" | tee -a /tmp/results.txt
+              echo "  text=$(printf '%s' "$clean" | tail -2 | tr '\n' '|' | head -c 220)"
+            done
+            unset HTTPS_PROXY HTTP_PROXY ALL_PROXY
+            kill $pid 2>/dev/null || true
+            wait $pid 2>/dev/null || true
+          done
+
+      - name: summary
+        if: always()
+        run: |
+          echo "### shard ${{ matrix.shard }} (runner ip above)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/results.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no results" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
