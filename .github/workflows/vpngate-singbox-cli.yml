@@ -98,7 +98,6 @@ jobs:
               set +e
               out=$(timeout 120 opencode run -m opencode/deepseek-v4.1-flash-free "第${round}次：请用一句话说明你能做什么。只回复这一句。" 2>&1)
               rc=$?
-              set -e
               clean=$(printf '%s' "$out" | sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\r//g')
               if [ $rc -eq 0 ] && [ ${#clean} -gt 25 ]; then verdict="OK200"
               elif printf '%s' "$clean" | grep -q 'Free usage limit'; then verdict="429"
