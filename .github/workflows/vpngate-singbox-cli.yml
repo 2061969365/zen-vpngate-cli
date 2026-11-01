@@ -69,6 +69,7 @@ jobs:
       - name: run cli through each vpn node
         run: |
           set -u
+          set +e
           n=$(cat /tmp/node_count)
           : > /tmp/results.txt
           for i in $(seq 0 $((n-1))); do
