@@ -61,13 +61,21 @@ def run_node(idx: int, ep: dict) -> dict:
     try:
         if not wait_port(port, proc, time.time() + 25):
             return rec
-        body = curl(port, "https://api.ipify.org/?format=text", []).stdout.strip()
-        rec["exit_ip"] = body[:40]
-        code = curl(port, "https://api.ipify.org", ["-o", "/dev/null", "-w", "%{http_code}"]).stdout.strip()
-        rec["ipify"] = code or "000"
-        if rec["ipify"] != "200":
+        code = "000"
+        deadline = time.time() + 50
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break
+            r = curl(port, "https://api.ipify.org", ["-o", "/dev/null", "-w", "%{http_code}"], timeout=8)
+            code = (r.stdout or "").strip() or "000"
+            if code == "200":
+                break
+            time.sleep(2)
+        rec["ipify"] = code
+        if code != "200":
             rec["verdict"] = "NO_EGRESS"
             return rec
+        rec["exit_ip"] = curl(port, "https://api.ipify.org/?format=text", []).stdout.strip()[:40]
         env = dict(os.environ,
                    HTTPS_PROXY=f"http://127.0.0.1:{port}",
                    HTTP_PROXY=f"http://127.0.0.1:{port}",
